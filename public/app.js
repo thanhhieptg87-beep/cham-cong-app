@@ -2,7 +2,8 @@
 const DEFAULT_LEGEND = [
   { sym: "X", label: "Công đủ 1 ngày", cong: 1 },
   { sym: "P", label: "Phép", cong: 1 },
-  { sym: "C", label: "Ca khác / nghỉ có phép", cong: 0.5 },
+  { sym: "S", label: "Ca sáng", cong: 0.5 },
+  { sym: "C", label: "Ca chiều", cong: 0.5 },
   { sym: "NC", label: "Nghỉ chờ việc / nghỉ có lương", cong: 0 },
   { sym: "O", label: "Nghỉ không phép", cong: 0 },
 ];
@@ -200,7 +201,7 @@ async function handleFiles(fileList) {
 // so we NEVER ask for the whole table (names + 31 days x many employees) in one call.
 // Instead: 1) read the roster (names only, tiny output), 2) read attendance codes in
 // small batches of employees per call. This keeps every response short and reliable.
-const BATCH_SIZE = 8;
+const BATCH_SIZE = 6;
 
 async function callClaude(system, content, maxTokens) {
   let response;
@@ -299,20 +300,20 @@ Giữ đúng thứ tự nhân viên từ trên xuống dưới như trong ảnh.
   return parsed.pages || [];
 }
 
-// Phase 2: read day-by-day codes for a small batch of employees (by position).
+// Phase 2: read day-by-day codes for a small batch of employees (matched by STT, không phải theo vị trí).
 async function extractDaysBatch(img, page, batchEmployees, nDays) {
-  const list = batchEmployees.map((e, i) => `${i + 1}. ${e.ho || ""} ${e.ten || ""} (MSNV ${e.msnv || "?"})`).join("\n");
+  const list = batchEmployees.map((e) => `STT ${e.stt || "?"}: ${e.ho || ""} ${e.ten || ""} (MSNV ${e.msnv || "?"})`).join("\n");
   const system = `Bạn đọc ẢNH bảng chấm công viết tay (bộ phận: ${page.boPhan || "?"}, tháng ${page.thang || "?"}/${page.nam || "?"}). Ảnh có thể xoay bất kỳ hướng nào.
-Chỉ đọc dữ liệu chấm công của ĐÚNG ${batchEmployees.length} nhân viên sau, theo ĐÚNG thứ tự liệt kê (đây là thứ tự các dòng liên tiếp trong bảng):
+CHỈ đọc dữ liệu chấm công của ĐÚNG ${batchEmployees.length} nhân viên sau. QUAN TRỌNG: xác định đúng dòng của mỗi người bằng cách khớp với SỐ THỨ TỰ (cột STT) in/viết ở ngoài cùng bên trái ảnh, KHÔNG dựa vào việc đếm dòng hay vị trí:
 ${list}
 Với mỗi ngày từ 1 đến ${nDays}, mã hoá ô thành chuỗi ngắn:
-- Ký hiệu chữ không kèm số (X, P, C, NC, O...) => chính ký hiệu đó, in hoa. VD "X".
+- Ký hiệu chữ không kèm số => chính ký hiệu đó, in hoa. Các ký hiệu thường gặp: X = làm cả ngày, S = ca sáng, C = ca chiều, P = phép, NC = nghỉ chờ việc, O = nghỉ không phép. Có thể có ký hiệu khác ngoài danh sách này, cứ chép đúng chữ viết trong ảnh.
 - Ký hiệu chữ kèm số viết thêm (thường mực đỏ = giờ tăng ca) => nối liền, VD "X3.5".
 - Chỉ có số, không có chữ => chính số đó, VD "5.83".
 - Ô trống / cột gạch chéo (thường Chủ nhật) / không rõ => chuỗi rỗng "".
-Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON, theo đúng thứ tự đã liệt kê ở trên:
-{"employees":[{"days":{"1":"X","2":"","3":"X3.5", ... đến "${nDays}"}}]}`;
-  const content = [imgBlock(img), { type: "text", text: "Đọc dữ liệu chấm công theo đúng thứ tự nhân viên đã nêu." }];
+Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON. Với MỖI nhân viên PHẢI ghi lại đúng "stt" của người đó (lấy từ cột STT trong ảnh) để đối chiếu:
+{"employees":[{"stt":"1","days":{"1":"X","2":"","3":"X3.5", ... đến "${nDays}"}}]}`;
+  const content = [imgBlock(img), { type: "text", text: "Đọc dữ liệu chấm công theo đúng STT đã nêu, ghi lại đúng stt của từng người." }];
   const parsed = await callClaude(system, content, 2500);
   return parsed.employees || [];
 }
@@ -337,22 +338,33 @@ async function scanAllImages(imageBlocks, onProgress) {
       }
 
       for (let b = 0; b < emps.length; b += BATCH_SIZE) {
-        const batch = emps.slice(b, b + BATCH_SIZE);
+        let batch = emps.slice(b, b + BATCH_SIZE);
         onProgress(`Đang đọc chấm công "${page.boPhan || "bảng " + (i + 1)}" - nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)}/${emps.length}...`);
-        let daysRes = await extractDaysBatch(img, page, batch, nDays);
-        if (daysRes.length !== batch.length) {
-          // Số người AI trả về không khớp số người yêu cầu -> dữ liệu chắc chắn bị lệch hàng nếu cứ gán thẳng.
-          // Thử lại 1 lần với batch nhỏ hơn (4 người) để AI dễ bám đúng dòng hơn trên ảnh nghiêng.
-          const half = Math.ceil(batch.length / 2);
-          const sub1 = batch.slice(0, half), sub2 = batch.slice(half);
-          const r1 = await extractDaysBatch(img, page, sub1, nDays);
-          const r2 = sub2.length ? await extractDaysBatch(img, page, sub2, nDays) : [];
-          daysRes = r1.concat(r2);
+
+        // Thử tối đa 2 lần: lần 2 chỉ hỏi lại đúng những người chưa khớp được STT ở lần 1.
+        let remaining = batch;
+        for (let attempt = 0; attempt < 2 && remaining.length; attempt++) {
+          const daysRes = await extractDaysBatch(img, page, remaining, nDays);
+          const byStt = {};
+          daysRes.forEach((r) => { if (r && r.stt != null && String(r.stt).trim() !== "") byStt[String(r.stt).trim()] = r.days || {}; });
+
+          const stillMissing = [];
+          remaining.forEach((emp, k) => {
+            const key = String(emp.stt || "").trim();
+            if (key && byStt.hasOwnProperty(key)) {
+              emp.days = byStt[key];
+            } else if (!key && daysRes[k]) {
+              // Nhân viên không có STT hợp lệ trong roster -> đành khớp theo vị trí (ít tin cậy hơn)
+              emp.days = daysRes[k].days || {};
+            } else {
+              stillMissing.push(emp);
+            }
+          });
+          remaining = stillMissing;
         }
-        if (daysRes.length !== batch.length) {
-          warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)} có thể bị đọc lệch hàng do ảnh nghiêng. Vui lòng kiểm tra kỹ phần này, hoặc chụp lại ảnh thẳng hơn rồi quét lại riêng phần đó.`);
+        if (remaining.length) {
+          warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": không khớp được dữ liệu chấm công cho STT ${remaining.map((e) => e.stt || "?").join(", ")} (ảnh nghiêng/khó đọc khiến AI đọc sót). Kiểm tra và điền tay phần này, hoặc chụp lại rõ hơn rồi quét riêng phần đó.`);
         }
-        daysRes.forEach((r, k) => { if (batch[k]) batch[k].days = r.days || {}; });
       }
       allPages.push(page);
     }
