@@ -23,6 +23,7 @@ let state = {
   stats: { scannedToday: 0, employeesSeen: 0, exportsCount: 0 },
   loadingMsg: "",
   errorMsg: "",
+  rotateModal: null,   // {idx, angle} khi đang mở popup xoay ảnh
 };
 
 const $app = document.getElementById("app");
@@ -597,7 +598,9 @@ function render() {
   else if (state.screen === "review") html = renderReview();
   else if (state.screen === "settings") html = renderSettings();
   else if (state.screen === "history") html = renderHistory();
+  if (state.rotateModal) html += renderRotateModal();
   $app.innerHTML = html;
+  if (state.rotateModal) setupRotatePreview();
 }
 
 function topBar(title, back) {
@@ -667,7 +670,11 @@ function openCapture(mode) {
 
 function renderCapture() {
   const thumbs = state.files.map((f, i) => `
-    <div class="thumb"><img src="${f.dataUrl}"><button class="rm" onclick="removeFile(${i})">✕</button></div>
+    <div class="thumb">
+      <img src="${f.dataUrl}">
+      <button class="rm" onclick="removeFile(${i})">✕</button>
+      <button class="rotate-btn" onclick="openRotateModal(${i})" title="Xoay ảnh cho thẳng">🔄</button>
+    </div>
   `).join("");
   return `
   ${topBar("Chụp / Chọn ảnh", true)}
@@ -681,7 +688,7 @@ function renderCapture() {
         <div class="s">Có thể chọn nhiều ảnh cùng lúc (mỗi ảnh 1 bảng/tổ)</div>
       </div>
       <input type="file" id="fileInput" accept="image/*,application/pdf" multiple style="display:none" onchange="handleFiles(this.files)">
-      ${thumbs ? `<div class="thumbs">${thumbs}</div>` : ""}
+      ${thumbs ? `<div class="thumbs">${thumbs}</div><div class="muted" style="margin-top:8px">Mẹo: ảnh chụp bị nghiêng thì bấm 🔄 trên ảnh để xoay thẳng lại trước khi quét — giúp AI đọc đúng dòng/cột hơn nhiều.</div>` : ""}
     </div>
     ${state.files.length ? `
     <button class="btn btn-primary btn-block" onclick="runScan()">✨ Quét bằng AI (${state.files.length} ảnh)</button>
@@ -691,6 +698,118 @@ function renderCapture() {
 }
 
 function removeFile(i) { state.files.splice(i, 1); render(); }
+
+/* ============ XOAY ẢNH CHO THẲNG TRƯỚC KHI QUÉT ============ */
+let rotateImgEl = null;
+
+function openRotateModal(i) {
+  state.rotateModal = { idx: i, angle: 0 };
+  render();
+}
+function closeRotateModal() {
+  state.rotateModal = null;
+  render();
+}
+
+function renderRotateModal() {
+  return `
+  <div class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-title">Xoay ảnh cho thẳng</div>
+      <div class="canvas-wrap"><canvas id="rotateCanvas"></canvas></div>
+      <div class="row-gap" style="align-items:center;margin-top:10px">
+        <button class="btn btn-ghost btn-sm" onclick="nudgeRotate(-90)">⟲ 90°</button>
+        <input type="range" id="rotateSlider" min="-45" max="45" step="0.5" value="0" oninput="updateRotatePreview(this.value)" style="flex:1">
+        <button class="btn btn-ghost btn-sm" onclick="nudgeRotate(90)">⟳ 90°</button>
+      </div>
+      <div class="muted" style="text-align:center;margin-top:4px">Góc xoay: <b id="rotateAngleLabel">0°</b> — kéo thanh trượt để chỉnh nhẹ (±45°) cho các dòng/cột trong ảnh nằm ngang/dọc thẳng</div>
+      <div class="row-gap" style="margin-top:14px">
+        <button class="btn btn-outline btn-block" onclick="closeRotateModal()">Huỷ</button>
+        <button class="btn btn-primary btn-block" onclick="applyRotate()">Áp dụng</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function setupRotatePreview() {
+  const m = state.rotateModal;
+  if (!m) return;
+  const f = state.files[m.idx];
+  if (!f) return;
+  rotateImgEl = new Image();
+  rotateImgEl.onload = () => drawRotatePreview(m.angle);
+  rotateImgEl.src = f.dataUrl;
+  const slider = document.getElementById("rotateSlider");
+  if (slider) slider.value = m.angle;
+}
+
+function computeRotatedSize(w, h, angleDeg) {
+  const rad = (angleDeg * Math.PI) / 180;
+  const absCos = Math.abs(Math.cos(rad)), absSin = Math.abs(Math.sin(rad));
+  return { w: Math.round(w * absCos + h * absSin), h: Math.round(w * absSin + h * absCos), rad };
+}
+
+function drawRotatePreview(angleDeg) {
+  if (!rotateImgEl || !rotateImgEl.width) return;
+  const canvas = document.getElementById("rotateCanvas");
+  if (!canvas) return;
+  const w = rotateImgEl.width, h = rotateImgEl.height;
+  const { w: newW, h: newH, rad } = computeRotatedSize(w, h, angleDeg);
+  const MAXW = 640; // giới hạn kích thước hiển thị cho nhẹ, không ảnh hưởng ảnh gốc khi Áp dụng
+  const scale = newW > MAXW ? MAXW / newW : 1;
+  canvas.width = Math.round(newW * scale);
+  canvas.height = Math.round(newH * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(rad);
+  ctx.scale(scale, scale);
+  ctx.drawImage(rotateImgEl, -w / 2, -h / 2);
+  ctx.restore();
+}
+
+function updateRotatePreview(val) {
+  if (!state.rotateModal) return;
+  state.rotateModal.angle = parseFloat(val);
+  drawRotatePreview(state.rotateModal.angle);
+  const label = document.getElementById("rotateAngleLabel");
+  if (label) label.textContent = Math.round(state.rotateModal.angle * 10) / 10 + "°";
+}
+
+function nudgeRotate(delta) {
+  if (!state.rotateModal) return;
+  let a = state.rotateModal.angle + delta;
+  if (a > 180) a -= 360;
+  if (a < -180) a += 360;
+  state.rotateModal.angle = a;
+  drawRotatePreview(a);
+  const slider = document.getElementById("rotateSlider");
+  if (slider && a >= -45 && a <= 45) slider.value = a;
+  const label = document.getElementById("rotateAngleLabel");
+  if (label) label.textContent = Math.round(a * 10) / 10 + "°";
+}
+
+function applyRotate() {
+  const m = state.rotateModal;
+  if (!m || !rotateImgEl || !rotateImgEl.width) { closeRotateModal(); return; }
+  const w = rotateImgEl.width, h = rotateImgEl.height;
+  const { w: newW, h: newH, rad } = computeRotatedSize(w, h, m.angle);
+  const canvas = document.createElement("canvas");
+  canvas.width = newW; canvas.height = newH;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, newW, newH);
+  ctx.translate(newW / 2, newH / 2);
+  ctx.rotate(rad);
+  ctx.drawImage(rotateImgEl, -w / 2, -h / 2);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+  state.files[m.idx] = { ...state.files[m.idx], dataUrl, base64: dataUrl.split(",")[1], mediaType: "image/jpeg" };
+  state.rotateModal = null;
+  render();
+  toast("Đã xoay ảnh — kiểm tra lại trước khi quét.");
+}
 
 function renderProcessing() {
   return `
