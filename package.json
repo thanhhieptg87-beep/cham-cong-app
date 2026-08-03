@@ -1,0 +1,17 @@
+{
+  "name": "cham-cong-ai",
+  "version": "1.0.0",
+  "description": "App cham cong AI - quet bang cham cong viet tay bang AI, xuat Excel",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+  }
+}
