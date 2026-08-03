@@ -300,23 +300,30 @@ Giữ đúng thứ tự nhân viên từ trên xuống dưới như trong ảnh.
   return parsed.pages || [];
 }
 
-// Phase 2: read day-by-day codes for a small batch of employees (matched by STT, không phải theo vị trí).
-async function extractDaysBatch(img, page, batchEmployees, nDays) {
+// Phase 2: read day-by-day codes for a small batch of employees, CHỈ một khoảng ngày (vd 1-16),
+// matched theo STT chứ không theo vị trí. Đọc từng khoảng ngày nhỏ giúp AI không bị "đuối" khi
+// phải quét hết 31 cột cùng lúc - hay chính là nguyên nhân bỏ sót các cột cuối bảng (gần mép ảnh).
+async function extractDaysBatch(img, page, batchEmployees, dayFrom, dayTo) {
   const list = batchEmployees.map((e) => `STT ${e.stt || "?"}: ${e.ho || ""} ${e.ten || ""} (MSNV ${e.msnv || "?"})`).join("\n");
   const system = `Bạn đọc ẢNH bảng chấm công viết tay (bộ phận: ${page.boPhan || "?"}, tháng ${page.thang || "?"}/${page.nam || "?"}). Ảnh có thể xoay bất kỳ hướng nào.
-CHỈ đọc dữ liệu chấm công của ĐÚNG ${batchEmployees.length} nhân viên sau. QUAN TRỌNG: xác định đúng dòng của mỗi người bằng cách khớp với SỐ THỨ TỰ (cột STT) in/viết ở ngoài cùng bên trái ảnh, KHÔNG dựa vào việc đếm dòng hay vị trí:
+CHỈ đọc dữ liệu chấm công của ĐÚNG ${batchEmployees.length} nhân viên sau, và CHỈ đọc các CỘT NGÀY từ ${dayFrom} đến ${dayTo} (bỏ qua mọi cột ngày khác, kể cả khi chúng nằm trong cùng ảnh). QUAN TRỌNG:
+- Xác định đúng DÒNG của mỗi người bằng cách khớp với SỐ THỨ TỰ (cột STT) in/viết ở ngoài cùng bên trái ảnh.
+- Xác định đúng CỘT bằng cách khớp với SỐ NGÀY ghi ở hàng tiêu đề phía trên mỗi cột (1,2,3...31), KHÔNG đếm cột theo vị trí - đặc biệt các cột gần mép ảnh (số ngày lớn) dễ bị bỏ sót do ảnh nghiêng, phải đọc kỹ.
+Danh sách nhân viên cần đọc:
 ${list}
-Với mỗi ngày từ 1 đến ${nDays}, mã hoá ô thành chuỗi ngắn:
+Với mỗi ngày từ ${dayFrom} đến ${dayTo}, mã hoá ô thành chuỗi ngắn:
 - Ký hiệu chữ không kèm số => chính ký hiệu đó, in hoa. Các ký hiệu thường gặp: X = làm cả ngày, S = ca sáng, C = ca chiều, P = phép, NC = nghỉ chờ việc, O = nghỉ không phép. Có thể có ký hiệu khác ngoài danh sách này, cứ chép đúng chữ viết trong ảnh.
 - Ký hiệu chữ kèm số viết thêm (thường mực đỏ = giờ tăng ca) => nối liền, VD "X3.5".
 - Chỉ có số, không có chữ => chính số đó, VD "5.83".
-- Ô trống / cột gạch chéo (thường Chủ nhật) / không rõ => chuỗi rỗng "".
-Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON. Với MỖI nhân viên PHẢI ghi lại đúng "stt" của người đó (lấy từ cột STT trong ảnh) để đối chiếu:
-{"employees":[{"stt":"1","days":{"1":"X","2":"","3":"X3.5", ... đến "${nDays}"}}]}`;
-  const content = [imgBlock(img), { type: "text", text: "Đọc dữ liệu chấm công theo đúng STT đã nêu, ghi lại đúng stt của từng người." }];
-  const parsed = await callClaude(system, content, 2500);
+- Ô THỰC SỰ trống / cột gạch chéo (thường Chủ nhật) / không rõ => chuỗi rỗng "". KHÔNG được để trống nếu ô đó thực ra có đánh dấu, dù mờ.
+Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON. Với MỖI nhân viên PHẢI ghi lại đúng "stt" của người đó, và "days" CHỈ chứa các ngày từ ${dayFrom} đến ${dayTo}:
+{"employees":[{"stt":"1","days":{"${dayFrom}":"X", "...":"...", "${dayTo}":"X"}}]}`;
+  const content = [imgBlock(img), { type: "text", text: `Đọc dữ liệu chấm công các cột ngày ${dayFrom} đến ${dayTo}, theo đúng STT đã nêu.` }];
+  const parsed = await callClaude(system, content, 1800);
   return parsed.employees || [];
 }
+
+const DAY_CHUNK_SIZE = 16;
 
 async function scanAllImages(imageBlocks, onProgress) {
   const allPages = [];
@@ -328,6 +335,7 @@ async function scanAllImages(imageBlocks, onProgress) {
     for (const page of rosterPages) {
       const emps = page.employees || [];
       const nDays = daysInMonth(page.thang, page.nam);
+      emps.forEach((e) => { e.days = e.days || {}; });
 
       // Cảnh báo nếu STT bị nhảy cóc (dấu hiệu ảnh nghiêng làm AI đọc sót dòng)
       const sttNums = emps.map((e) => parseInt(e.stt, 10)).filter((n) => !isNaN(n));
@@ -338,32 +346,33 @@ async function scanAllImages(imageBlocks, onProgress) {
       }
 
       for (let b = 0; b < emps.length; b += BATCH_SIZE) {
-        let batch = emps.slice(b, b + BATCH_SIZE);
-        onProgress(`Đang đọc chấm công "${page.boPhan || "bảng " + (i + 1)}" - nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)}/${emps.length}...`);
+        const batch = emps.slice(b, b + BATCH_SIZE);
 
-        // Thử tối đa 2 lần: lần 2 chỉ hỏi lại đúng những người chưa khớp được STT ở lần 1.
-        let remaining = batch;
-        for (let attempt = 0; attempt < 2 && remaining.length; attempt++) {
-          const daysRes = await extractDaysBatch(img, page, remaining, nDays);
-          const byStt = {};
-          daysRes.forEach((r) => { if (r && r.stt != null && String(r.stt).trim() !== "") byStt[String(r.stt).trim()] = r.days || {}; });
+        for (let dayFrom = 1; dayFrom <= nDays; dayFrom += DAY_CHUNK_SIZE) {
+          const dayTo = Math.min(dayFrom + DAY_CHUNK_SIZE - 1, nDays);
+          onProgress(`Đang đọc chấm công "${page.boPhan || "bảng " + (i + 1)}" - nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)}/${emps.length} - ngày ${dayFrom}-${dayTo}...`);
 
-          const stillMissing = [];
-          remaining.forEach((emp, k) => {
-            const key = String(emp.stt || "").trim();
-            if (key && byStt.hasOwnProperty(key)) {
-              emp.days = byStt[key];
-            } else if (!key && daysRes[k]) {
-              // Nhân viên không có STT hợp lệ trong roster -> đành khớp theo vị trí (ít tin cậy hơn)
-              emp.days = daysRes[k].days || {};
-            } else {
-              stillMissing.push(emp);
-            }
-          });
-          remaining = stillMissing;
-        }
-        if (remaining.length) {
-          warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": không khớp được dữ liệu chấm công cho STT ${remaining.map((e) => e.stt || "?").join(", ")} (ảnh nghiêng/khó đọc khiến AI đọc sót). Kiểm tra và điền tay phần này, hoặc chụp lại rõ hơn rồi quét riêng phần đó.`);
+          // Thử tối đa 2 lần: lần 2 chỉ hỏi lại đúng những người chưa khớp được STT ở lần 1.
+          let remaining = batch;
+          for (let attempt = 0; attempt < 2 && remaining.length; attempt++) {
+            const daysRes = await extractDaysBatch(img, page, remaining, dayFrom, dayTo);
+            const byStt = {};
+            daysRes.forEach((r) => { if (r && r.stt != null && String(r.stt).trim() !== "") byStt[String(r.stt).trim()] = r.days || {}; });
+
+            const stillMissing = [];
+            remaining.forEach((emp, k) => {
+              const key = String(emp.stt || "").trim();
+              let d = null;
+              if (key && byStt.hasOwnProperty(key)) d = byStt[key];
+              else if (!key && daysRes[k]) d = daysRes[k].days || {};
+              if (d) Object.assign(emp.days, d);
+              else stillMissing.push(emp);
+            });
+            remaining = stillMissing;
+          }
+          if (remaining.length) {
+            warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": không khớp được dữ liệu ngày ${dayFrom}-${dayTo} cho STT ${remaining.map((e) => e.stt || "?").join(", ")} (ảnh nghiêng/khó đọc khiến AI đọc sót). Kiểm tra và điền tay phần này, hoặc chụp lại rõ hơn rồi quét riêng phần đó.`);
+          }
         }
       }
       allPages.push(page);
