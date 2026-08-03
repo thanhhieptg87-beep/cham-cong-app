@@ -279,6 +279,7 @@ Trả lời DUY NHẤT JSON, không markdown, theo đúng thứ tự đã liệt
 
 async function scanAllImages(imageBlocks, onProgress) {
   const allPages = [];
+  const warnings = [];
   for (let i = 0; i < imageBlocks.length; i++) {
     const img = imageBlocks[i];
     onProgress(`Đang đọc danh sách nhân viên (ảnh ${i + 1}/${imageBlocks.length})...`);
@@ -286,16 +287,37 @@ async function scanAllImages(imageBlocks, onProgress) {
     for (const page of rosterPages) {
       const emps = page.employees || [];
       const nDays = daysInMonth(page.thang, page.nam);
+
+      // Cảnh báo nếu STT bị nhảy cóc (dấu hiệu ảnh nghiêng làm AI đọc sót dòng)
+      const sttNums = emps.map((e) => parseInt(e.stt, 10)).filter((n) => !isNaN(n));
+      for (let k = 1; k < sttNums.length; k++) {
+        if (sttNums[k] - sttNums[k - 1] > 1) {
+          warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": có thể thiếu nhân viên STT ${sttNums[k - 1] + 1}-${sttNums[k] - 1} (ảnh bị nghiêng nên AI đọc sót dòng). Kiểm tra lại và chụp ảnh thẳng hơn nếu cần.`);
+        }
+      }
+
       for (let b = 0; b < emps.length; b += BATCH_SIZE) {
         const batch = emps.slice(b, b + BATCH_SIZE);
         onProgress(`Đang đọc chấm công "${page.boPhan || "bảng " + (i + 1)}" - nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)}/${emps.length}...`);
-        const daysRes = await extractDaysBatch(img, page, batch, nDays);
+        let daysRes = await extractDaysBatch(img, page, batch, nDays);
+        if (daysRes.length !== batch.length) {
+          // Số người AI trả về không khớp số người yêu cầu -> dữ liệu chắc chắn bị lệch hàng nếu cứ gán thẳng.
+          // Thử lại 1 lần với batch nhỏ hơn (4 người) để AI dễ bám đúng dòng hơn trên ảnh nghiêng.
+          const half = Math.ceil(batch.length / 2);
+          const sub1 = batch.slice(0, half), sub2 = batch.slice(half);
+          const r1 = await extractDaysBatch(img, page, sub1, nDays);
+          const r2 = sub2.length ? await extractDaysBatch(img, page, sub2, nDays) : [];
+          daysRes = r1.concat(r2);
+        }
+        if (daysRes.length !== batch.length) {
+          warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)} có thể bị đọc lệch hàng do ảnh nghiêng. Vui lòng kiểm tra kỹ phần này, hoặc chụp lại ảnh thẳng hơn rồi quét lại riêng phần đó.`);
+        }
         daysRes.forEach((r, k) => { if (batch[k]) batch[k].days = r.days || {}; });
       }
       allPages.push(page);
     }
   }
-  return allPages;
+  return { pages: allPages, warnings };
 }
 
 async function runScan() {
@@ -305,7 +327,7 @@ async function runScan() {
   state.errorMsg = "";
   render();
   try {
-    const pages = await scanAllImages(state.files, (msg) => { state.loadingMsg = msg; render(); });
+    const { pages, warnings } = await scanAllImages(state.files, (msg) => { state.loadingMsg = msg; render(); });
     if (!pages.length) throw new Error("Không nhận diện được bảng chấm công nào trong ảnh.");
     state.pages = pages;
     state.activePage = 0;
@@ -315,7 +337,13 @@ async function runScan() {
     state.stats.employeesSeen = (state.stats.employeesSeen || 0) + empCount;
     await saveStats();
     render();
-    toast(`Đã quét xong ${pages.length} bảng, ${empCount} nhân viên.`);
+    if (warnings.length) {
+      state.errorMsg = "⚠ " + warnings.join(" | ");
+      render();
+      toast(`Đã quét xong nhưng có ${warnings.length} chỗ nghi ngờ đọc sai — xem chi tiết ở trên, nên kiểm tra kỹ trước khi xuất file.`, 6000);
+    } else {
+      toast(`Đã quét xong ${pages.length} bảng, ${empCount} nhân viên.`);
+    }
   } catch (e) {
     console.error(e);
     state.errorMsg = e.message || "Có lỗi xảy ra khi quét ảnh.";
@@ -326,78 +354,138 @@ async function runScan() {
 }
 
 /* ============ EXPORT TO EXCEL (matches original template layout) ============ */
+function isSundayCol(thang, nam, day) {
+  const m = parseInt(thang, 10), y = parseInt(nam, 10);
+  if (!m || !y) return false;
+  return new Date(y, m - 1, day).getDay() === 0;
+}
+
+const THIN_BORDER = {
+  top: { style: "thin", color: { argb: "FFB9C9F0" } },
+  left: { style: "thin", color: { argb: "FFB9C9F0" } },
+  bottom: { style: "thin", color: { argb: "FFB9C9F0" } },
+  right: { style: "thin", color: { argb: "FFB9C9F0" } },
+};
+const FILL_SUNDAY = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD6D9E0" } }; // xám
+const FILL_HEADER = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEAF1FF" } };
+const FILL_TITLE = { type: "pattern", pattern: "solid", fgColor: { argb: "FFDCE6FA" } };
+
+function styleCell(cell, { bold, fill, align = "center", size, italic, color } = {}) {
+  cell.border = THIN_BORDER;
+  cell.alignment = { horizontal: align, vertical: "middle", wrapText: true };
+  cell.font = { bold: !!bold, italic: !!italic, size: size || 11, color: color ? { argb: color } : undefined };
+  if (fill) cell.fill = fill;
+}
+
 function buildWorkbook() {
-  const wb = XLSX.utils.book_new();
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Cham cong AI";
   const summaryRows = [["Bộ phận", "STT", "Họ", "Tên", "MSNV", "Ghi chú", "Số ngày công", "Giờ tăng ca"]];
 
   state.pages.forEach((page, idx) => {
     const nDays = daysInMonth(page.thang, page.nam);
-    const aoa = [];
-    aoa.push([`BẢNG CHẤM CÔNG THÁNG ${page.thang || ""} NĂM ${page.nam || ""}`]);
-    aoa.push([`BỘ PHẬN: ${page.boPhan || ""}`]);
-    const header = ["STT", "Họ", "Tên", "MSNV"];
-    for (let d = 1; d <= nDays; d++) header.push(d);
-    header.push("GHI CHÚ", "SỐ CÔNG", "T.CA");
-    aoa.push(header);
+    const firstDayCol = 5; // A STT,B Họ,C Tên,D MSNV, E = ngày 1...
+    const lastDayCol = firstDayCol + nDays - 1;
+    const ghiChuCol = lastDayCol + 1;
+    const soCongCol = lastDayCol + 2;
+    const tcaCol = lastDayCol + 3;
 
-    const merges = [
-      { s: { r: 0, c: 0 }, e: { r: 0, c: header.length - 1 } },
-      { s: { r: 1, c: 0 }, e: { r: 1, c: header.length - 1 } },
-    ];
-    const otColRefs = []; // for formula building: {rowIndexInAoa}
+    const sheetName = (page.boPhan || `Bang${idx + 1}`).substring(0, 28).replace(/[\\/*?:\[\]]/g, "");
+    const ws = wb.addWorksheet(sheetName || `Bang${idx + 1}`);
 
+    // Tiêu đề
+    ws.mergeCells(1, 1, 1, tcaCol);
+    styleCell(ws.getCell(1, 1), { bold: true, size: 13, fill: FILL_TITLE });
+    ws.getCell(1, 1).value = `BẢNG CHẤM CÔNG THÁNG ${page.thang || ""} NĂM ${page.nam || ""}`;
+
+    ws.mergeCells(2, 1, 2, tcaCol);
+    styleCell(ws.getCell(2, 1), { bold: true, fill: FILL_TITLE });
+    ws.getCell(2, 1).value = `BỘ PHẬN: ${page.boPhan || ""}`;
+
+    // Hàng tiêu đề cột
+    const headerRow = 3;
+    const headers = ["STT", "Họ", "Tên", "MSNV"];
+    for (let d = 1; d <= nDays; d++) headers.push(d);
+    headers.push("GHI CHÚ", "SỐ CÔNG", "T.CA");
+    headers.forEach((h, i) => {
+      const cell = ws.getCell(headerRow, i + 1);
+      cell.value = h;
+      styleCell(cell, { bold: true, fill: FILL_HEADER });
+    });
+    for (let d = 1; d <= nDays; d++) {
+      if (isSundayCol(page.thang, page.nam, d)) ws.getCell(headerRow, firstDayCol + d - 1).fill = FILL_SUNDAY;
+    }
+
+    let r = headerRow + 1;
     (page.employees || []).forEach((emp) => {
-      const symRow = [emp.stt || "", emp.ho || "", emp.ten || "", emp.msnv || ""];
-      const otRow = ["", "", "", ""];
-      let cong = 0, tangCa = 0;
+      const symRow = r, otRow = r + 1;
+      const rr = computeRow(state.settings, emp.days || {});
+      const cong = rr.cong, tangCa = rr.tangCa;
+
+      // Cột tĩnh: gộp ô theo chiều dọc giữa dòng ký hiệu + dòng giờ tăng ca
+      [[1, emp.stt || "", "center"], [2, emp.ho || "", "left"], [3, emp.ten || "", "left"], [4, emp.msnv || "", "center"], [ghiChuCol, emp.ghiChu || "", "left"]]
+        .forEach(([col, val, align]) => {
+          ws.mergeCells(symRow, col, otRow, col);
+          const cell = ws.getCell(symRow, col);
+          cell.value = val;
+          styleCell(cell, { align });
+          ws.getCell(otRow, col).border = THIN_BORDER;
+        });
+
+      // SỐ CÔNG (dòng ký hiệu) và T.CA = tổng giờ tăng ca (dòng phụ, có công thức)
+      const congCell = ws.getCell(symRow, soCongCol);
+      congCell.value = cong;
+      styleCell(congCell, { bold: true });
+      ws.getCell(otRow, soCongCol).border = THIN_BORDER;
+
+      const startRef = ws.getCell(otRow, firstDayCol).address;
+      const endRef = ws.getCell(otRow, lastDayCol).address;
+      const tcaCell = ws.getCell(otRow, tcaCol);
+      tcaCell.value = { formula: `SUM(${startRef}:${endRef})` };
+      styleCell(tcaCell, { bold: true });
+      ws.getCell(symRow, tcaCol).border = THIN_BORDER;
+
+      // Các cột ngày 1..N
       for (let d = 1; d <= nDays; d++) {
         const code = (emp.days && emp.days[String(d)]) || "";
         const { symbol, num } = parseCell(code);
-        symRow.push(symbol || (num !== null && !symbol ? "" : ""));
-        // decide what goes on which row
-        if (symbol && num !== null) { symRow[symRow.length - 1] = symbol; otRow.push(num); }
-        else if (symbol) { otRow.push(""); }
-        else if (num !== null) { symRow[symRow.length - 1] = ""; otRow.push(num); }
-        else { otRow.push(""); }
+        const col = firstDayCol + d - 1;
+        const sunday = isSundayCol(page.thang, page.nam, d);
+        const symCell = ws.getCell(symRow, col);
+        const otCell = ws.getCell(otRow, col);
+        if (symbol && num !== null) { symCell.value = symbol; otCell.value = num; }
+        else if (symbol) { symCell.value = symbol; otCell.value = ""; }
+        else if (num !== null) { symCell.value = ""; otCell.value = num; }
+        else { symCell.value = ""; otCell.value = ""; }
+        styleCell(symCell, { fill: sunday ? FILL_SUNDAY : null });
+        styleCell(otCell, { fill: sunday ? FILL_SUNDAY : null, italic: true, size: 9, color: "FFB45309" });
       }
-      const r = computeRow(state.settings, emp.days || {});
-      cong = r.cong; tangCa = r.tangCa;
-      symRow.push(emp.ghiChu || "");
-      symRow.push(cong);
-      symRow.push("");
-      otRow.push("");
-      otRow.push("");
-      const otRowIndexPlaceholder = aoa.length + 1; // will be row of otRow (0-indexed) after pushing symRow
-      aoa.push(symRow);
-      aoa.push(otRow);
-      otColRefs.push({ rowIdx: aoa.length - 1, nDays });
+
       summaryRows.push([page.boPhan || "", emp.stt || "", emp.ho || "", emp.ten || "", emp.msnv || "", emp.ghiChu || "", cong, tangCa]);
+      r += 2;
     });
 
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws["!merges"] = merges;
-    // set T.CA formula = sum of day-hour cells in the OT row
-    const firstDayColIdx = 4; // 0-based: A STT,B Họ,C Tên,D MSNV,E day1...
-    otColRefs.forEach(({ rowIdx, nDays }) => {
-      const lastDayColIdx = firstDayColIdx + nDays - 1;
-      const tcaColIdx = firstDayColIdx + nDays + 2; // + GHI CHU + SO CONG + T.CA
-      const startCellRef = XLSX.utils.encode_cell({ r: rowIdx, c: firstDayColIdx });
-      const endCellRef = XLSX.utils.encode_cell({ r: rowIdx, c: lastDayColIdx });
-      const cellRef = XLSX.utils.encode_cell({ r: rowIdx, c: tcaColIdx });
-      ws[cellRef] = { t: "n", f: `SUM(${startCellRef}:${endCellRef})` };
-    });
-    // column widths
-    ws["!cols"] = [{ wch: 5 }, { wch: 14 }, { wch: 10 }, { wch: 9 }]
-      .concat(Array.from({ length: nDays }, () => ({ wch: 4.2 })))
-      .concat([{ wch: 8 }, { wch: 9 }, { wch: 7 }]);
-
-    const sheetName = (page.boPhan || `Bang${idx + 1}`).substring(0, 28).replace(/[\\/*?:\[\]]/g, "");
-    XLSX.utils.book_append_sheet(wb, ws, sheetName || `Bang${idx + 1}`);
+    ws.getColumn(1).width = 5;
+    ws.getColumn(2).width = 14;
+    ws.getColumn(3).width = 10;
+    ws.getColumn(4).width = 9;
+    for (let d = 0; d < nDays; d++) ws.getColumn(firstDayCol + d).width = 4.3;
+    ws.getColumn(ghiChuCol).width = 10;
+    ws.getColumn(soCongCol).width = 9;
+    ws.getColumn(tcaCol).width = 7;
+    ws.views = [{ state: "frozen", ySplit: headerRow, xSplit: 4 }];
   });
 
-  const wsSum = XLSX.utils.aoa_to_sheet(summaryRows);
-  wsSum["!cols"] = [{ wch: 16 }, { wch: 6 }, { wch: 14 }, { wch: 10 }, { wch: 9 }, { wch: 10 }, { wch: 12 }, { wch: 12 }];
-  XLSX.utils.book_append_sheet(wb, wsSum, "Tong hop");
+  const wsSum = wb.addWorksheet("Tong hop");
+  summaryRows.forEach((row, ri) => {
+    row.forEach((val, ci) => {
+      const cell = wsSum.getCell(ri + 1, ci + 1);
+      cell.value = val;
+      styleCell(cell, { bold: ri === 0, fill: ri === 0 ? FILL_HEADER : null, align: ci === 2 || ci === 3 ? "left" : "center" });
+    });
+  });
+  wsSum.columns = [{ width: 16 }, { width: 6 }, { width: 14 }, { width: 10 }, { width: 9 }, { width: 10 }, { width: 12 }, { width: 12 }];
+  wsSum.views = [{ state: "frozen", ySplit: 1 }];
 
   return wb;
 }
@@ -407,7 +495,13 @@ async function exportExcel() {
     const wb = buildWorkbook();
     const first = state.pages[0] || {};
     const fname = `bang_cham_cong_T${first.thang || ""}_${first.nam || ""}.xlsx`;
-    XLSX.writeFile(wb, fname);
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
     state.stats.exportsCount = (state.stats.exportsCount || 0) + 1;
     await saveStats();
     render();
@@ -554,6 +648,7 @@ function renderReview() {
   if (!state.pages.length) {
     return `${topBar("Kết quả", true)}<div class="content"><div class="empty"><div class="ic">📭</div><div>Chưa có dữ liệu. Hãy quét một bảng chấm công.</div></div></div>`;
   }
+  const warnBanner = state.errorMsg ? `<div class="card" style="border:1px solid #f6d38a;background:#fffaf0"><div class="muted" style="color:#92610c">${esc(state.errorMsg)}</div></div>` : "";
   const tabs = state.pages.map((p, i) => `<button class="${i === state.activePage ? "active" : ""}" onclick="switchPage(${i})">${esc(p.boPhan || "Bảng " + (i + 1))}</button>`).join("");
   const page = state.pages[state.activePage];
   const nDays = daysInMonth(page.thang, page.nam);
@@ -587,6 +682,7 @@ function renderReview() {
   return `
   ${topBar("Kết quả quét", true)}
   <div class="content">
+    ${warnBanner}
     <div class="pagepick">${tabs}</div>
     <div class="card">
       <div class="row-gap" style="margin-bottom:8px">
