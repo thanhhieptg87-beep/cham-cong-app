@@ -235,12 +235,41 @@ async function callClaude(system, content, maxTokens) {
   try {
     return JSON.parse(raw);
   } catch (e) {
-    const s = raw.indexOf("{"), en = raw.lastIndexOf("}");
-    const s2 = raw.indexOf("["), en2 = raw.lastIndexOf("]");
-    if (s >= 0 && en > s) return JSON.parse(raw.slice(s, en + 1));
-    if (s2 >= 0 && en2 > s2) return JSON.parse(raw.slice(s2, en2 + 1));
-    throw new Error("Không đọc được kết quả AI trả về (có thể bị cắt do dài quá).");
+    const extracted = extractFirstJsonBlock(raw);
+    if (extracted) {
+      try { return JSON.parse(extracted); } catch (e2) { /* rơi xuống dưới */ }
+    }
+    throw new Error("Không đọc được kết quả AI trả về (định dạng không hợp lệ, có thể do ảnh khó đọc). Thử quét lại.");
   }
+}
+
+// Tìm khối JSON { } hoặc [ ] ĐẦU TIÊN, tính đúng độ sâu ngoặc và bỏ qua ngoặc nằm trong chuỗi text,
+// để không bị lẫn nếu AI lỡ viết thêm chữ (có dấu ngoặc) sau đoạn JSON.
+function extractFirstJsonBlock(raw) {
+  const objStart = raw.indexOf("{");
+  const arrStart = raw.indexOf("[");
+  let start = -1, openCh, closeCh;
+  if (objStart === -1 && arrStart === -1) return null;
+  if (arrStart === -1 || (objStart !== -1 && objStart < arrStart)) { start = objStart; openCh = "{"; closeCh = "}"; }
+  else { start = arrStart; openCh = "["; closeCh = "]"; }
+
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === openCh) depth++;
+    else if (c === closeCh) {
+      depth--;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 function imgBlock(img) {
@@ -251,7 +280,7 @@ function imgBlock(img) {
 async function extractRoster(img) {
   const system = `Bạn đọc ẢNH một BẢNG CHẤM CÔNG viết tay của nhà máy Việt Nam. Ảnh có thể bị xoay bất kỳ hướng nào - tự xác định hướng đúng bằng cách tìm hàng tiêu đề "STT/Họ/Tên/MSNV" và dãy số ngày 1..31.
 CHỈ đọc phần DANH SÁCH NHÂN VIÊN (KHÔNG đọc dữ liệu chấm công từng ngày). Nếu ảnh có nhiều bộ phận/tổ khác nhau, tách thành nhiều phần tử "pages".
-Trả lời DUY NHẤT JSON, không markdown, theo schema:
+Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON, theo schema:
 {"pages":[{"boPhan":"...","thang":"07","nam":"2026","employees":[{"stt":"1","ho":"...","ten":"...","msnv":"...","ghiChu":"..."}]}]}
 Giữ đúng thứ tự nhân viên từ trên xuống dưới như trong ảnh.`;
   const content = [imgBlock(img), { type: "text", text: "Đọc danh sách nhân viên trong bảng chấm công này." }];
@@ -270,7 +299,7 @@ Với mỗi ngày từ 1 đến ${nDays}, mã hoá ô thành chuỗi ngắn:
 - Ký hiệu chữ kèm số viết thêm (thường mực đỏ = giờ tăng ca) => nối liền, VD "X3.5".
 - Chỉ có số, không có chữ => chính số đó, VD "5.83".
 - Ô trống / cột gạch chéo (thường Chủ nhật) / không rõ => chuỗi rỗng "".
-Trả lời DUY NHẤT JSON, không markdown, theo đúng thứ tự đã liệt kê ở trên:
+Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON, theo đúng thứ tự đã liệt kê ở trên:
 {"employees":[{"days":{"1":"X","2":"","3":"X3.5", ... đến "${nDays}"}}]}`;
   const content = [imgBlock(img), { type: "text", text: "Đọc dữ liệu chấm công theo đúng thứ tự nhân viên đã nêu." }];
   const parsed = await callClaude(system, content, 2500);
