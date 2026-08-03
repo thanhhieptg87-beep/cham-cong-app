@@ -316,15 +316,20 @@ Với mỗi ngày từ ${dayFrom} đến ${dayTo}, mã hoá ô thành chuỗi ng
 - Ký hiệu chữ không kèm số => chính ký hiệu đó, in hoa. Các ký hiệu thường gặp: X = làm cả ngày, S = ca sáng, C = ca chiều, P = phép, NC = nghỉ chờ việc, O = nghỉ không phép. Có thể có ký hiệu khác ngoài danh sách này, cứ chép đúng chữ viết trong ảnh.
 - Ký hiệu chữ kèm số viết thêm (thường mực đỏ = giờ tăng ca) => nối liền, VD "X3.5".
 - Chỉ có số, không có chữ => chính số đó, VD "5.83".
-- Ô THỰC SỰ trống / cột gạch chéo (thường Chủ nhật) / không rõ => chuỗi rỗng "". KHÔNG được để trống nếu ô đó thực ra có đánh dấu, dù mờ.
+- Ô THỰC SỰ trống, cột Chủ nhật (thường tô xám/gạch chéo), hoặc không đọc rõ được => chuỗi rỗng "".
+QUY TẮC BẮT BUỘC - CHỐNG BỊA DỮ LIỆU (rất quan trọng vì đây là dữ liệu tính lương thật):
+- CHỈ ghi ký hiệu khi bạn THỰC SỰ NHÌN THẤY nét mực/nét viết tay rõ ràng trong đúng ô đó. Nếu không chắc chắn hoặc ô mờ không đọc được, PHẢI trả về chuỗi rỗng "" - TUYỆT ĐỐI không đoán bừa.
+- KHÔNG được suy luận/đoán ô này dựa trên các ô khác cùng dòng, dòng khác, hoặc "khuôn mẫu" (ví dụ: không được nghĩ "cả tháng đa số là X nên ô này chắc cũng là X" nếu không nhìn thấy nét viết thật trong đúng ô đó).
+- Cột Chủ nhật (cột tô xám hoặc gạch chéo) LUÔN luôn để trống "" - không ai chấm công ngày Chủ nhật, kể cả khi bạn tưởng như thấy vệt mực nào đó ở đó.
+- Một số nhân viên có thể đã NGHỈ VIỆC giữa tháng - từ ngày đó trở đi trong ảnh sẽ KHÔNG có ô nào được đánh dấu (trống thật sự đến hết tháng). Đây là dữ liệu ĐÚNG, không phải bạn đọc thiếu - phải giữ nguyên trống "", KHÔNG được tự điền X hay bất kỳ ký hiệu nào cho những ngày đó.
 Trả lời DUY NHẤT JSON hợp lệ, không markdown, không thêm bất kỳ chữ, ghi chú hay giải thích nào trước hoặc sau JSON. Với MỖI nhân viên PHẢI ghi lại đúng "stt" của người đó, và "days" CHỈ chứa các ngày từ ${dayFrom} đến ${dayTo}:
-{"employees":[{"stt":"1","days":{"${dayFrom}":"X", "...":"...", "${dayTo}":"X"}}]}`;
+{"employees":[{"stt":"1","days":{"${dayFrom}":"X", "...":"...", "${dayTo}":""}}]}`;
   const content = [imgBlock(img), { type: "text", text: `Đọc dữ liệu chấm công các cột ngày ${dayFrom} đến ${dayTo}, theo đúng STT đã nêu.` }];
   const parsed = await callClaude(system, content, 1800);
   return parsed.employees || [];
 }
 
-const DAY_CHUNK_SIZE = 16;
+const DAY_CHUNK_SIZE = 10;
 
 async function scanAllImages(imageBlocks, onProgress) {
   const allPages = [];
@@ -353,7 +358,9 @@ async function scanAllImages(imageBlocks, onProgress) {
           const dayTo = Math.min(dayFrom + DAY_CHUNK_SIZE - 1, nDays);
           onProgress(`Đang đọc chấm công "${page.boPhan || "bảng " + (i + 1)}" - nhân viên ${b + 1}-${Math.min(b + BATCH_SIZE, emps.length)}/${emps.length} - ngày ${dayFrom}-${dayTo}...`);
 
-          // Thử tối đa 2 lần: lần 2 chỉ hỏi lại đúng những người chưa khớp được STT ở lần 1.
+          // Thử tối đa 2 lần: lần 2 chỉ hỏi lại đúng những người chưa khớp được STT,
+          // HOẶC đã khớp STT nhưng bị thiếu ngày nào đó trong chuỗi ngày yêu cầu
+          // (AI thỉnh thoảng dừng viết JSON sớm cho 1 nhân viên dù JSON vẫn hợp lệ).
           let remaining = batch;
           for (let attempt = 0; attempt < 2 && remaining.length; attempt++) {
             const daysRes = await extractDaysBatch(img, page, remaining, dayFrom, dayTo);
@@ -366,13 +373,19 @@ async function scanAllImages(imageBlocks, onProgress) {
               let d = null;
               if (key && byStt.hasOwnProperty(key)) d = byStt[key];
               else if (!key && daysRes[k]) d = daysRes[k].days || {};
-              if (d) Object.assign(emp.days, d);
-              else stillMissing.push(emp);
+              if (!d) { stillMissing.push(emp); return; }
+              Object.assign(emp.days, d); // giữ lại phần đã đọc được, dù có thể chưa đủ hết
+
+              let complete = true;
+              for (let day = dayFrom; day <= dayTo; day++) {
+                if (!Object.prototype.hasOwnProperty.call(d, String(day))) { complete = false; break; }
+              }
+              if (!complete) stillMissing.push(emp); // thiếu ngày nào đó -> hỏi lại
             });
             remaining = stillMissing;
           }
           if (remaining.length) {
-            warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": không khớp được dữ liệu ngày ${dayFrom}-${dayTo} cho STT ${remaining.map((e) => e.stt || "?").join(", ")} (ảnh nghiêng/khó đọc khiến AI đọc sót). Kiểm tra và điền tay phần này, hoặc chụp lại rõ hơn rồi quét riêng phần đó.`);
+            warnings.push(`"${page.boPhan || "bảng " + (i + 1)}": không đọc đủ dữ liệu ngày ${dayFrom}-${dayTo} cho STT ${remaining.map((e) => e.stt || "?").join(", ")} (AI bỏ sót dù ảnh có thể vẫn rõ). Kiểm tra và điền tay phần này, hoặc chụp/xoay lại ảnh rồi quét riêng phần đó.`);
           }
         }
       }
@@ -400,9 +413,18 @@ async function runScan() {
     await saveStats();
     render();
     if (warnings.length) {
-      state.errorMsg = "⚠ " + warnings.join(" | ");
+      const severe = warnings.length >= 3;
+      const headline = severe
+        ? "⚠ Ảnh chụp có thể bị MỜ hoặc CHỤP XÉO NGHIÊNG khiến AI đọc sai/sót khá nhiều chỗ. Bạn nên bấm 🔄 xoay ảnh cho thẳng lại (hoặc chụp/chọn ảnh khác rõ nét, thẳng góc hơn) rồi Quét lại, thay vì sửa tay từng ô."
+        : "⚠ Ảnh có thể hơi mờ hoặc nghiêng nên có vài chỗ AI đọc chưa chắc chắn — kiểm tra kỹ trước khi xuất file, hoặc thử xoay ảnh thẳng lại rồi quét lại nếu muốn chính xác hơn.";
+      state.errorMsg = headline + " Chi tiết: " + warnings.join(" | ");
       render();
-      toast(`Đã quét xong nhưng có ${warnings.length} chỗ nghi ngờ đọc sai — xem chi tiết ở trên, nên kiểm tra kỹ trước khi xuất file.`, 6000);
+      toast(
+        severe
+          ? "Ảnh có vẻ mờ/nghiêng nên nhiều chỗ đọc chưa chắc chắn. Thử xoay ảnh thẳng lại (nút 🔄) rồi quét lại."
+          : `Đã quét xong nhưng có ${warnings.length} chỗ nghi ngờ đọc chưa chắc — xem chi tiết ở trên.`,
+        6000
+      );
     } else {
       toast(`Đã quét xong ${pages.length} bảng, ${empCount} nhân viên.`);
     }
@@ -828,7 +850,10 @@ function renderReview() {
   if (!state.pages.length) {
     return `${topBar("Kết quả", true)}<div class="content"><div class="empty"><div class="ic">📭</div><div>Chưa có dữ liệu. Hãy quét một bảng chấm công.</div></div></div>`;
   }
-  const warnBanner = state.errorMsg ? `<div class="card" style="border:1px solid #f6d38a;background:#fffaf0"><div class="muted" style="color:#92610c">${esc(state.errorMsg)}</div></div>` : "";
+  const warnBanner = state.errorMsg ? `<div class="card" style="border:1px solid #f6d38a;background:#fffaf0">
+    <div class="muted" style="color:#92610c;margin-bottom:8px">${esc(state.errorMsg)}</div>
+    <button class="btn btn-outline btn-sm" onclick="goScreen('capture')">🔄 Quay lại xoay/chọn ảnh khác & quét lại</button>
+  </div>` : "";
   const tabs = state.pages.map((p, i) => `<button class="${i === state.activePage ? "active" : ""}" onclick="switchPage(${i})">${esc(p.boPhan || "Bảng " + (i + 1))}</button>`).join("");
   const page = state.pages[state.activePage];
   const nDays = daysInMonth(page.thang, page.nam);
