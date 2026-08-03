@@ -217,8 +217,19 @@ async function callClaude(system, content, maxTokens) {
   } catch (e) {
     throw new Error("Không kết nối được tới máy chủ. Kiểm tra kết nối mạng và thử lại. Chi tiết: " + (e && e.message ? e.message : String(e)));
   }
+  let rawResp;
+  try { rawResp = await response.text(); } catch (e) { throw new Error("Không đọc được phản hồi từ máy chủ."); }
   let data;
-  try { data = await response.json(); } catch (e) { throw new Error("AI trả về dữ liệu không hợp lệ."); }
+  try {
+    data = JSON.parse(rawResp);
+  } catch (e) {
+    const snippet = rawResp.replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(
+      `Máy chủ trả về dữ liệu không phải JSON (mã ${response.status}). ` +
+      (snippet ? `Nội dung nhận được: "${snippet}${rawResp.length > 160 ? "..." : ""}"` : "Phản hồi rỗng.") +
+      " Có thể do máy chủ Render bị treo/khởi động lại — thử đợi chút rồi quét lại."
+    );
+  }
   if (data.error) throw new Error(data.error.message || "Lỗi gọi AI");
   const textBlock = (data.content || []).find((b) => b.type === "text");
   if (!textBlock) {
